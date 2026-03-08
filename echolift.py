@@ -1,7 +1,6 @@
 import os
 import subprocess
 import time
-from collections.abc import Sequence
 from datetime import datetime
 
 import cv2
@@ -29,12 +28,11 @@ def generate_qr(url):
 qr_img = generate_qr(SERVER_URL)
 qr_h, qr_w, _ = qr_img.shape
 
-
 os.makedirs(SAVE_PATH, exist_ok=True)
 
 
 # EINSTELLUNGEN
-VIDEO_SOURCE = 1
+VIDEO_SOURCE = 0
 DELAY_SECONDS = 10
 FPS = 30
 WIDTH, HEIGHT = 1920, 1080
@@ -45,6 +43,7 @@ video = cv2.VideoCapture(VIDEO_SOURCE)
 
 # MJPG is a good choice for webcam capture, as it provides a good balance between quality
 # and performance
+# usb logitech
 video.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*'MJPG'))
 # we set the desired resolution for the capture
 video.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
@@ -124,13 +123,15 @@ def apply_gym_filter(frame):
 def put_text(
 	frame: MatLike,
 	text: str,
-	position: Sequence[int],
+	position_percent: tuple[float, float],
 	font_scale: float = 1,
 	color=(255, 255, 255),
 	thickness=2,
 	font_face=cv2.FONT_HERSHEY_SIMPLEX,
 	line_type=cv2.LINE_AA,
 ):
+	h, w = frame.shape[:2]
+	position = (int(w * position_percent[0]), int(h * position_percent[1]))
 	cv2.putText(
 		frame,
 		text,
@@ -150,6 +151,11 @@ while True:
 	# 1. Frame von Kamera lesen (nur wenn wir nicht im Replay sind)
 	if state != 'REPLAY' and state != 'PROCESSING':
 		ret, frame = video.read()
+
+		# Wenn Daten korrupt sind, liefert OpenCV oft ein leeres Bild oder None
+		if not ret or frame is None or frame.size == 0:
+			continue  # Überspringe diesen Frame einfach und nimm den nächsten
+
 		frame = apply_gym_filter(frame)
 		if not ret:
 			break
@@ -166,7 +172,7 @@ while True:
 		put_text(
 			display_frame,
 			f'FPS: {int(fps)}',
-			(10, 50),
+			(0.05, 0.05),
 			font_scale=1,
 			color=(0, 255, 0),
 			thickness=2,
@@ -182,11 +188,11 @@ while True:
 			text = str(remaining)
 			# Dicke (thickness) auf 15 für massiven Look
 
-			if display_frame:
+			if display_frame and display_frame.any():
 				put_text(
 					display_frame,
 					text,
-					(WIDTH // 2 - 60, HEIGHT // 2 + 50),
+					(0.3, 0.5),
 					font_scale=7,
 					color=(0, 255, 255),
 					thickness=15,
@@ -198,7 +204,6 @@ while True:
 			temp_filename = os.path.join(SAVE_PATH, f'lift_{timestamp}_temp.avi')
 			replay_filename = os.path.join(SAVE_PATH, f'lift_{timestamp}.mp4')
 			fourcc = cv2.VideoWriter.fourcc(*'MJPG')
-			print(fourcc)
 			video_writer = cv2.VideoWriter(
 				temp_filename,  # the temporary raw video file (MJPG)
 				fourcc,  # this is the codec for MJPG
@@ -210,21 +215,14 @@ while True:
 
 	# --- LOGIK: RECORDING ---
 	elif state == 'RECORDING':
-		if frame and video_writer:
+		if frame and frame.any() and video_writer:
 			video_writer.write(frame)
 		frame_count += 1
-		if display_frame:
-			cv2.circle(
-				display_frame,
-				(50, 90),  # x/y coordinates
-				20,  # radius
-				(0, 0, 255),  # color (BGR)
-				-1,  # thickness (-1 = filled circle)
-			)
+		if display_frame and display_frame.any():
 			put_text(
 				display_frame,
 				'REC',
-				(80, 100),
+				(0.05, 0.1),
 				font_scale=1,
 				color=(0, 0, 255),
 				thickness=2,
@@ -297,20 +295,11 @@ while True:
 		if ret:
 			display_frame = apply_gym_filter(frame)
 			# Overlay für den Lade-Status
-			overlay = display_frame.copy()
-			cv2.rectangle(
-				overlay,
-				(WIDTH // 2 - 200, HEIGHT // 2 - 50),
-				(WIDTH // 2 + 200, HEIGHT // 2 + 50),
-				(0, 0, 0),
-				-1,
-			)
-			cv2.addWeighted(overlay, 0.6, display_frame, 0.4, 0, display_frame)
 
 			put_text(
 				display_frame,
 				'PROCESSING LIFT...',
-				(WIDTH // 2 - 160, HEIGHT // 2 + 10),
+				(0.3, 0.5),
 				font_scale=1.2,
 				color=(0, 165, 255),
 				thickness=3,
@@ -334,7 +323,7 @@ while True:
 		continue
 
 	# display the current frame (with overlays) in LIVE and COUNTDOWN states
-	if display_frame:
+	if display_frame and display_frame.any():
 		cv2.imshow(window_name, display_frame)
 
 	# key press handling for LIVE and COUNTDOWN states (REPLAY state is handled separately above)
@@ -357,22 +346,25 @@ while True:
 			# Konvertierung mit eingebauter Zeitlupe (0.5x)
 			cmd = [
 				'ffmpeg',
-				'-y',  # overwrite output file if it exists
-				'-r',  # input framerate
-				# the actual measureed FPS from the recording, so that we keep the original speed
-				# before applying the slow-motion effect
-				str(measured_fps),
-				'-i',  # input file
-				temp_filename,  # the temporary raw video file (MJPG)
-				'-vf',  # video filter
-				'setpts=2.0*PTS',  # 0.5x time (slow motion)
-				'-c:v',  # video codec
-				'libx264',  # we use H.264 for good compression and quality
-				'-pix_fmt',  # pixel format for better compatibility (especially for web playback)
-				'yuv420p',  # this pixel format is widely compatible with players and web browsers
-				# "-preset",  # preset for encoding speed vs. compression efficiency
-				# "veryfast",  # "ultrafast" is the fastest but results in larger files
-				replay_filename,  # the final output file with slow-motion effect
+				'-y',
+				'-r',
+				str(measured_fps),  # Input FPS
+				'-i',
+				temp_filename,  # Quelle 0: Video
+				'-i',
+				'static/NORDLICHT.png',  # Quelle 1: Logo
+				'-filter_complex',
+				# Schritt 1: Logo skalieren -> [logo]
+				# Schritt 2: Video (0:v) verlangsamen -> [slow]
+				# Schritt 3: [logo] über [slow] legen
+				'[1:v]scale=200:-1[logo];[0:v]setpts=2.0*PTS[slow];[slow][logo]overlay=20:main_h-overlay_h-20',
+				'-c:v',
+				'libx264',
+				'-preset',
+				'ultrafast',  # WICHTIG: Damit du im Gym nicht ewig warten musst
+				'-pix_fmt',
+				'yuv420p',
+				replay_filename,
 			]
 			"""
             subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
