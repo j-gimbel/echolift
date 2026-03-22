@@ -17,42 +17,13 @@
     <h1>🏋️ Deine Lifts</h1>
 
     <div id="content-area">
-        {% if latest %}
         <div class="latest-box">
             <h3>Letzter Versuch (bereit)</h3>
             <video id="main-video" controls autoplay muted>
-                <source src="/static/videos/{{ latest }}" type="video/mp4">
+                <source src="/static/videos/{{ video }}" type="video/mp4">
             </video>
-            <a href="/static/videos/{{ latest }}" class="btn" download>DOWNLOAD CLIP</a>
+            <a href="/static/videos/{{ video }}" class="btn" download>DOWNLOAD CLIP</a>
         </div>
-        {% else %}
-            <p>Noch keine Aufnahmen vorhanden. Starte einen Lift!</p>
-        {% endif %}
     </div>
-
-    <div class="status-polling">Station aktiv - Automatische Aktualisierung an</div>
-
-    <script>
-        let currentLatest = "{{ latest }}";
-
-        async function checkNewVideo() {
-            try {
-                // Wir fragen einen speziellen API-Endpunkt nach dem neuesten Dateinamen
-                const response = await fetch('/api/latest');
-                const data = await response.json();
-                
-                if (data.latest && data.latest !== currentLatest) {
-                    console.log("Neues Video gefunden: " + data.latest);
-                    // Seite neu laden, um das neue Video anzuzeigen
-                    location.reload();
-                }
-            } catch (error) {
-                console.log("Server noch nicht bereit...");
-            }
-        }
-
-        // Alle 2 Sekunden prüfen
-        setInterval(checkNewVideo, 2000);
-    </script>
 </body>
 </html>

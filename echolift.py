@@ -25,8 +25,8 @@ def generate_qr(url):
 
 
 # QR-Code generieren (wir machen ihn ca. 150x150 Pixel groß)
-qr_img = generate_qr(SERVER_URL)
-qr_h, qr_w, _ = qr_img.shape
+# qr_img = generate_qr(SERVER_URL)
+# qr_h, qr_w, _ = qr_img.shape
 
 os.makedirs(SAVE_PATH, exist_ok=True)
 
@@ -147,8 +147,12 @@ def put_text(
 print("Station bereit. 'r' für Start/Stopp, 'q' zum Beenden.")
 
 
+qr_img = None
+
 while True:
 	# 1. Frame von Kamera lesen (nur wenn wir nicht im Replay sind)
+	qr_img = None  # QR-Code zurücksetzen, damit er im nächsten Replay neu generiert wird
+
 	if state != 'REPLAY' and state != 'PROCESSING':
 		ret, frame = video.read()
 
@@ -188,7 +192,7 @@ while True:
 			text = str(remaining)
 			# Dicke (thickness) auf 15 für massiven Look
 
-			if display_frame and display_frame.any():
+			if display_frame is not None and display_frame.any():
 				put_text(
 					display_frame,
 					text,
@@ -215,10 +219,10 @@ while True:
 
 	# --- LOGIK: RECORDING ---
 	elif state == 'RECORDING':
-		if frame and frame.any() and video_writer:
+		if frame is not None and frame.any() and video_writer:
 			video_writer.write(frame)
 		frame_count += 1
-		if display_frame and display_frame.any():
+		if display_frame is not None and display_frame.any():
 			put_text(
 				display_frame,
 				'REC',
@@ -242,7 +246,11 @@ while True:
 		# display QR code
 		margin = 30
 		# place QR code in the top-right corner with a margin
-		replay_frame[margin : margin + qr_h, WIDTH - qr_w - margin : WIDTH - margin] = qr_img
+		if qr_img is None:
+			qr_img = generate_qr(SERVER_URL + '?video=' + os.path.basename(replay_filename))
+			qr_h, qr_w, _ = qr_img.shape
+
+			replay_frame[margin : margin + qr_h, WIDTH - qr_w - margin : WIDTH - margin] = qr_img
 
 		# --- TEXTE ---
 		font = cv2.FONT_HERSHEY_DUPLEX
@@ -323,7 +331,7 @@ while True:
 		continue
 
 	# display the current frame (with overlays) in LIVE and COUNTDOWN states
-	if display_frame and display_frame.any():
+	if display_frame is not None and display_frame.any():
 		cv2.imshow(window_name, display_frame)
 
 	# key press handling for LIVE and COUNTDOWN states (REPLAY state is handled separately above)
