@@ -210,7 +210,6 @@ def draw_rotated_text(
 
 	h, w = frame.shape[:2]
 	position = (int(w * position_percent[0]), int(h * position_percent[1]))
-	print(f'Textgröße: {tw}x{th}, Position: {position}')
 
 	# Sicherheitscheck: Falls der Text leer ist
 	if tw <= 0 or th <= 0:
@@ -253,6 +252,7 @@ def draw_rotated_text(
 	w_real = x_end - x_start
 
 	if h_real > 0 and w_real > 0:
+		print(f'Placing text at: ({x_start}, {y_start}), size: ({w_real}x{h_real})')
 		# Nur den Teil des Textes nehmen, der auch ins Bild passt
 		roi = frame[y_start:y_end, x_start:x_end]
 		mask_part = mask[0:h_real, 0:w_real]
@@ -263,7 +263,7 @@ def draw_rotated_text(
 	return frame
 
 
-print("Station bereit. 'r' für Start/Stopp, 'q' zum Beenden.")
+print("Station bereit.  für Start/Stopp, 'q' zum Beenden.")
 
 
 qr_img = None
@@ -425,28 +425,21 @@ while True:
 
 			replay_frame[margin : margin + qr_h, WIDTH - qr_w - margin : WIDTH - margin] = qr_img
 
-		# --- TEXTE ---
-		font = cv2.FONT_HERSHEY_DUPLEX
+		# place "LOOP REPLAY"
 
-		# place "SCAN TO DOWNLOAD" left next to QR code, vertically centered with the QR code
-		put_text(
-			replay_frame,
-			'SCAN TO DOWNLOAD',
-			(WIDTH - qr_w - margin - 250, margin + qr_h // 2 + 5),
-			font_scale=0.6,
-			color=(255, 255, 255),
-			thickness=1,
-		)
-
-		# place "LOOP REPLAY" to top left corner
-		put_text(
-			replay_frame,
-			"LOOP REPLAY - 'R' TO STOP",
-			(30, 40),
-			font_scale=0.8,
-			color=(0, 255, 255),
-			thickness=2,
-		)
+		try:
+			draw_rotated_text(
+				replay_frame,
+				'REPLAY - SPACE TO STOP',
+				(0.2, 1.45),
+				cv2.FONT_HERSHEY_SIMPLEX,
+				1.25,
+				(0, 165, 255),
+				3,
+				90,
+			)
+		except Exception as e:
+			print(f'Fehler beim Zeichnen des Textes: {e}')
 
 		# this function is called only in REPLAY state, so we show the replay frame with QR code
 		# and texts.
@@ -464,7 +457,7 @@ while True:
 		wait_time = int(1000 / (actual_fps / 2))
 		key = cv2.waitKey(wait_time) & 0xFF
 
-		if key == ord('r'):
+		if key == ord(' '):
 			replay_video.release()
 			state = 'LIVE'
 		elif key == ord('q'):
@@ -514,8 +507,8 @@ while True:
 			replay_video = cv2.VideoCapture(replay_filename)
 			state = 'REPLAY'
 
-		# Auch hier auf 'q' prüfen, falls man abbrechen will
-		if cv2.waitKey(1) & 0xFF == ord('q'):
+		# Auch hier auf ' ' prüfen, falls man abbrechen will
+		if cv2.waitKey(1) & 0xFF == ord(' '):
 			break
 		continue
 
@@ -526,8 +519,10 @@ while True:
 	# key press handling for LIVE and COUNTDOWN states (REPLAY state is handled separately above)
 	key = cv2.waitKey(1) & 0xFF
 
-	# handle 'r' key for starting/stopping recording, and 'q' for quitting the application
-	if key == ord('r'):
+	# handle " " key for starting/stopping recording, and 'q' for quitting the application
+
+	print(state)
+	if key == ord(' '):
 		if state == 'LIVE':
 			state = 'COUNTDOWN'
 			countdown_timer = time.time()
@@ -592,7 +587,7 @@ while True:
             replay_video = cv2.VideoCapture(replay_filename)
             state = "REPLAY"
             """
-
+			print('converting video with FFmpeg, please wait...')
 			# Popen startet den Prozess, blockiert aber NICHT das Skript
 			ffmpeg_process = subprocess.Popen(
 				cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
@@ -601,7 +596,6 @@ while True:
 			# Sofort in den Replay-Modus springen geht jetzt nicht direkt,
 			# da die Datei erst fertig sein muss.
 			state = 'PROCESSING'  # Neuer Zwischenstatus
-			processing_start = time.time()
 
 	# handle 'q' key to quit the application
 	elif key == ord('q'):
