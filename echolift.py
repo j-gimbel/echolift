@@ -21,6 +21,7 @@ def generate_qr(url):
 	qr.make(fit=True)
 	img: PilImage = qr.make_image(fill_color='black', back_color='white')  # type: ignore
 	img: Image = img.convert('RGB')
+	print("all ok")
 	return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
 
@@ -32,7 +33,7 @@ os.makedirs(SAVE_PATH, exist_ok=True)
 
 
 # EINSTELLUNGEN
-VIDEO_SOURCE = 0
+VIDEO_SOURCE = 1
 DELAY_SECONDS = 10
 FPS = 30
 WIDTH, HEIGHT = 1920, 1080
@@ -45,6 +46,7 @@ video = cv2.VideoCapture(VIDEO_SOURCE)
 # and performance
 # usb logitech
 video.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*'MJPG'))
+
 # we set the desired resolution for the capture
 video.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
 video.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
@@ -300,6 +302,7 @@ while True:
 
 		frame = apply_gym_filter(frame)
 		if not ret:
+			print("break2")
 			break
 		display_frame = frame.copy()
 
@@ -364,12 +367,15 @@ while True:
 			timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 			temp_filename = os.path.join(SAVE_PATH, f'lift_{timestamp}_temp.avi')
 			replay_filename = os.path.join(SAVE_PATH, f'lift_{timestamp}.mp4')
-			fourcc = cv2.VideoWriter.fourcc(*'MJPG')
+			#fourcc = cv2.VideoWriter.fourcc(*'MJPG')
+
+			h, w = frame.shape[:2]
+			fourcc = cv2.VideoWriter_fourcc(*'XVID')
 			video_writer = cv2.VideoWriter(
 				temp_filename,  # the temporary raw video file (MJPG)
 				fourcc,  # this is the codec for MJPG
-				actual_fps,  # the actual FPS
-				(WIDTH, HEIGHT),
+				30.0,  # the actual FPS
+				(w,h),
 			)
 			start_time = time.time()
 			frame_count = 0
@@ -465,6 +471,8 @@ while True:
 		continue
 
 	elif state == 'PROCESSING':
+		time.sleep(0.5)  # Gib der CPU Luft zum Atmen
+
 		ret, frame = video.read()  # Weiterhin Live-Bild lesen
 		if ret:
 			display_frame = apply_gym_filter(frame)
@@ -499,16 +507,20 @@ while True:
 
 		# Prüfen, ob FFmpeg fertig ist
 		# poll() ist None, solange der Prozess läuft
-
-		if ffmpeg_process and ffmpeg_process.poll() is not None:
-			if os.path.exists(temp_filename):
-				os.remove(temp_filename)
+		 
+		if ffmpeg_process:# and ffmpeg_process.poll() is not None:
+			ffmpeg_result = ffmpeg_process.poll()
+			print(f"ffmpeg result: {ffmpeg_result}")
+			if ffmpeg_result is not None:
+				if os.path.exists(temp_filename):
+					os.remove(temp_filename)
 
 			replay_video = cv2.VideoCapture(replay_filename)
 			state = 'REPLAY'
 
 		# Auch hier auf ' ' prüfen, falls man abbrechen will
 		if cv2.waitKey(1) & 0xFF == ord(' '):
+			print("break1")
 			break
 		continue
 
@@ -521,7 +533,7 @@ while True:
 
 	# handle " " key for starting/stopping recording, and 'q' for quitting the application
 
-	print(state)
+	#print(state)
 	if key == ord(' '):
 		if state == 'LIVE':
 			state = 'COUNTDOWN'
@@ -562,8 +574,8 @@ while True:
 			cmd = [
 				'ffmpeg',
 				'-y',
-				'-r',
-				str(measured_fps or 30),  # Input FPS mit Fallback
+				#'-r',
+				#str(measured_fps or 30),  # Input FPS mit Fallback
 				'-i',
 				temp_filename,  # Einzige Quelle: Das Video inkl. Logo
 				'-vf',
@@ -574,6 +586,19 @@ while True:
 				'ultrafast',  # Maximale Geschwindigkeit
 				'-pix_fmt',
 				'yuv420p',  # Standard-Format für maximale Kompatibilität
+				replay_filename,
+			]
+
+			# Wir fügen 'nice -n 15' vor den eigentlichen Befehl
+			cmd = [
+				'nice', '-n', '15', 
+				'ffmpeg', '-y',
+				'-i', temp_filename,
+				'-vf', 'setpts=2.0*PTS',
+				'-c:v', 'libx264',
+				'-preset', 'ultrafast',
+				'-threads', '1',  # WICHTIG: Begrenze auf 1 Kern, damit 1-3 Kerne für Python frei bleiben
+				'-pix_fmt', 'yuv420p',
 				replay_filename,
 			]
 
@@ -592,6 +617,10 @@ while True:
 			ffmpeg_process = subprocess.Popen(
 				cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
 			)
+
+			print (f"ffmpeg strarted with code {ffmpeg_process.poll()}")
+
+			
 
 			# Sofort in den Replay-Modus springen geht jetzt nicht direkt,
 			# da die Datei erst fertig sein muss.
