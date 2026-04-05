@@ -1,2 +1,6 @@
-SERVER_URL="http://192.168.178.82:8000"
-SAVE_PATH="static/videos"
+server_url="http://192.168.178.82:8000"
+save_path="static/videos"
+fps=30
+video_source=0
+logo_width=0.2
+countdown_duration=3
