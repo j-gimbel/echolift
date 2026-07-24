@@ -87,7 +87,7 @@ def initialize_video(config: Config):
 	# we create a named window with the fullscreen property
 	cv2.namedWindow('Lifter', cv2.WND_PROP_FULLSCREEN)
 	# we get the actual FPS from the camera, which is important for accurate timing and recording,
-	# cv2.setWindowProperty('Lifter', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)  #
+	cv2.setWindowProperty('Lifter', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)  #
 	# actual_fps = video.get(cv2.CAP_PROP_FPS) or 60.0
 	# Buffer-Größe reduzieren, um Latenz/Korruption zu minimieren
 	# video.set(cv2.CAP_PROP_BUFFERSIZE, 1)
