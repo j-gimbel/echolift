@@ -1,642 +1,681 @@
+# read yaml config  files
+import logging
+
+# import yaml
 import os
 import subprocess
+import sys
 import time
+import tomllib
 from datetime import datetime
+from enum import Enum
+from typing import Literal
 
 import cv2
 import numpy as np
 import qrcode
-from cv2.typing import MatLike
-from PIL.Image import Image
-from qrcode.image.pil import PilImage
 
-SERVER_URL = os.getenv('LIFTER_SERVER_URL', 'http://192.168.178.82:8000')
-SAVE_PATH = os.getenv('LIFTER_SAVE_PATH', 'static/videos')
+# from cv2 import config
+from PIL.Image import Image, logger
+from pydantic import BaseModel
+from qrcode.image.pil import PilImage
+from screeninfo import get_monitors
+from screeninfo.common import Monitor
+
+
+class Config(BaseModel):
+	server_url: str
+	save_path: str
+	fps: int
+	video_source: int
+	logo_width: float
+	countdown_duration: int
+	monitor: int = 0
+	fullscreen: bool = False
+
+
+class State(Enum):
+	LIVE = 1
+	COUNTDOWN = 2
+	RECORDING = 3
+	PROCESSING = 4
+	REPLAY = 5
+
+
+logState = State.LIVE
+
+
+logging.basicConfig(
+	level=logging.DEBUG,
+	format='%(asctime)s - %(levelname)s - %(message)s',
+	handlers=[
+		logging.FileHandler('debug.log'),  # Schreibt alles in diese Datei
+		logging.StreamHandler(),  # Zeigt es trotzdem in der Konsole
+	],
+)
+
+logging.info('App started')
+
+# read config from yaml file
+
+
+def read_config():
+	logging.info('Read config from config.toml')
+	with open('config.toml', 'rb') as f:
+		config_dict = tomllib.load(f)
+		try:
+			config = Config(**config_dict)
+		except Exception as e:
+			logging.error(f'Error occurred while parsing config: {e}')
+			raise e
+	return config
+
+
+def get_tv_monitor_coords(config: Config):
+	monitors: list[Monitor] = get_monitors()
+	# Wir nehmen den zweiten Monitor (Index 1)
+	# Meistens ist der Fernseher der zweite Eintrag
+	try:
+		tv = monitors[config.monitor]
+	except IndexError as e:
+		msg = f'Monitor index {config.monitor} is out of range. Available monitors: {len(monitors)}'
+		logging.error(msg)
+		raise Exception(msg) from e
+
+	return tv.x, tv.y
+
+
+def initialize_video(config: Config):
+	logging.info('Initializing video capture')
+
+	# initialize video capture
+
+	# Nutze CAP_V4L2 explizit
+	video = cv2.VideoCapture(config.video_source, cv2.CAP_V4L2)
+
+	# MJPG ist oft die Ursache für die Korruption bei Billig-Webcams/alten Controllern
+	# Wenn möglich, versuche YUYV (Standard weglassen) oder erhöhe den Buffer
+	video.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*'MJPG'))
+	video.set(cv2.CAP_PROP_FPS, config.fps)
+	video.set(cv2.CAP_PROP_FRAME_WIDTH, 192000)
+	video.set(cv2.CAP_PROP_FRAME_HEIGHT, 108000)
+
+	# we create a named window with the fullscreen property
+	cv2.namedWindow('Lifter', cv2.WND_PROP_FULLSCREEN)
+	# we get the actual FPS from the camera, which is important for accurate timing and recording,
+	if config.fullscreen:
+		logging.info('Setting window to fullscreen mode')
+		cv2.setWindowProperty('Lifter', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)  #
+	# actual_fps = video.get(cv2.CAP_PROP_FPS) or 60.0
+	# Buffer-Größe reduzieren, um Latenz/Korruption zu minimieren
+	# video.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+	x, y = get_tv_monitor_coords(config)
+	cv2.moveWindow('Lifter', x, y)
+
+	return video
 
 
 def generate_qr(url):
-	print('generating QR code for URL:', url)
-	qr = qrcode.QRCode(box_size=4, border=2)
+	logging.info('Generating QR code for URL: %s', url)
+	qr = qrcode.QRCode(box_size=12, border=2)
 	qr.add_data(url)
 	qr.make(fit=True)
 	img: PilImage = qr.make_image(fill_color='black', back_color='white')  # type: ignore
 	img: Image = img.convert('RGB')
-	print('all ok')
+	logging.info('QR code generated successfully')
 	return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
 
-# QR-Code generieren (wir machen ihn ca. 150x150 Pixel groß)
-# qr_img = generate_qr(SERVER_URL)
-# qr_h, qr_w, _ = qr_img.shape
+def add_logo(config: Config, frame: np.ndarray):
 
-os.makedirs(SAVE_PATH, exist_ok=True)
+	frame_height, frame_width = frame.shape[:2]
 
+	x = int(frame_width * 0.02)
+	y = int(frame_height * 0.05)
 
-# EINSTELLUNGEN
-VIDEO_SOURCE = 1
-DELAY_SECONDS = 10
-FPS = 30
-WIDTH, HEIGHT = 1920, 1080
+	logo_raw = cv2.imread('static/NORDLICHT.png', cv2.IMREAD_UNCHANGED)
+	if logo_raw is None:
+		logging.error('Failed to load logo image')
+		raise Exception('Failed to load logo image')
 
+	# logo_raw.shape
+	# (560, 1400, 4)
+	orig_logo_height = logo_raw.shape[0]
+	orig_logo_width = logo_raw.shape[1]
 
-# initialize video capture
-video = cv2.VideoCapture(VIDEO_SOURCE)
+	scaled_logo_width = int(config.logo_width * frame_height)
+	scaled_logo_height = int(orig_logo_height * scaled_logo_width / orig_logo_width)
 
-# MJPG is a good choice for webcam capture, as it provides a good balance between quality
-# and performance
-# usb logitech
-video.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*'MJPG'))
+	# 1. Skalieren (z.B. auf 200 Pixel Breite)
+	# ratio = 200 / orig_logo_width
+	# dim = (200, int(orig_logo_height * ratio))
+	logo_resized = cv2.resize(
+		logo_raw, (scaled_logo_width, scaled_logo_height), interpolation=cv2.INTER_AREA
+	)
 
-# we set the desired resolution for the capture
-video.set(cv2.CAP_PROP_FRAME_WIDTH, WIDTH)
-video.set(cv2.CAP_PROP_FRAME_HEIGHT, HEIGHT)
-# we set the desired FPS for the capture, which is important for ensuring smooth video
-# and good temporal resolution for analysis. The C930e can handle 1080p at 30
-video.set(cv2.CAP_PROP_FPS, FPS)
-window_name = 'Lifter'
-# we create a named window with the fullscreen property
-cv2.namedWindow(window_name, cv2.WND_PROP_FULLSCREEN)
-# we get the actual FPS from the camera, which is important for accurate timing and recording,
-cv2.setWindowProperty(window_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)  #
-actual_fps = video.get(cv2.CAP_PROP_FPS) or 60.0
+	# 2. Drehen (passend zu deinem Monitor gegen den Uhrzeigersinn)
+	# Wenn der Monitor nach links gekippt ist, drehen wir das Logo nach rechts
+	logo = cv2.rotate(logo_resized, cv2.ROTATE_90_COUNTERCLOCKWISE)
 
-
-# we initialize the video writer variable, which will be used later for recording the video.
-video_writer: cv2.VideoWriter | None = None
-
-# we initialize the replay video capture variable, which will be used later for
-# playing back the recorded video in a loop.
-replay_video: cv2.VideoCapture | None = None
-
-
-# FPS-calculation setup
-prev_frame_time = 0
-new_frame_time = 0
-frame_count = 0
-
-# various variables for managing the recording and replay process,
-# such as filenames, timers, and frame counts.
-temp_filename = ''
-replay_filename = ''
-countdown_timer = 0
-start_time = 0
-ffmpeg_process = None
-
-state = 'LIVE'  # possible states: LIVE, COUNTDOWN, RECORDING, REPLAY
-
-display_frame = None
-frame = None
-
-
-# WICHTIG: -1 lädt das PNG inklusive Transparenz (BGRA)
-"""
-logo = cv2.imread('static/NORDLICHT.png', -1)
-
-# Skalieren (falls nötig) unter Beibehaltung der 4 Kanäle
-logo = cv2.resize(logo, (300, 300))
-
-# Drehen (gegen den Uhrzeigersinn für dein Setup)
-logo = cv2.rotate(logo, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-# Logo um 90 Grad GEGEN den Uhrzeigersinn drehen
-# (Passend zur Drehung deines Monitors)
-rotated_logo = cv2.rotate(logo, cv2.ROTATE_90_COUNTERCLOCKWISE)
-"""
-
-# -1 ist entscheidend für den Alpha-Kanal (Transparenz)
-logo_raw = cv2.imread('static/NORDLICHT.png', cv2.IMREAD_UNCHANGED)
-
-# 1. Skalieren (z.B. auf 200 Pixel Breite)
-ratio = 200 / logo_raw.shape[1]
-dim = (200, int(logo_raw.shape[0] * ratio))
-logo_resized = cv2.resize(logo_raw, dim, interpolation=cv2.INTER_AREA)
-
-# 2. Drehen (passend zu deinem Monitor gegen den Uhrzeigersinn)
-# Wenn der Monitor nach links gekippt ist, drehen wir das Logo nach rechts
-logo_final = cv2.rotate(logo_resized, cv2.ROTATE_90_COUNTERCLOCKWISE)
-
-
-def overlay_transparent(background, overlay, x, y):
 	# 1. Prüfen, ob das Overlay einen Alpha-Kanal hat (4 Kanäle)
-	if overlay.shape[2] != 4:
+	if logo.shape[2] != 4:
 		# Falls kein Alpha-Kanal da ist, normales Slicing (dein aktueller Stand)
-		h, w = overlay.shape[:2]
-		background[y : y + h, x : x + w] = overlay
-		return background
+		h, w = logo.shape[:2]
+		frame[y : y + h, x : x + w] = logo
+		return frame
 
 	# 2. Alpha-Kanal extrahieren und normalisieren (0.0 bis 1.0)
-	alpha_mask = overlay[:, :, 3] / 255.0
-	overlay_color = overlay[:, :, :3]
+	alpha_mask = logo[:, :, 3] / 255.0
+	logo_color = logo[:, :, :3]
 
 	# 3. Den Bereich im Hintergrund definieren, wo das Logo hin soll
-	h, w = overlay.shape[:2]
+	h, w = logo.shape[:2]
 
 	# Sicherheitscheck für Bildgrenzen
-	if y + h > background.shape[0] or x + w > background.shape[1]:
-		return background
+	if y + h > frame.shape[0] or x + w > frame.shape[1]:
+		return frame
 
-	roi = background[y : y + h, x : x + w]
+	roi = frame[y : y + h, x : x + w]
 
 	# 4. Das Blending berechnen:
 	# Ergebnis = (Logo * Alpha) + (Hintergrund * (1 - Alpha))
 	for c in range(0, 3):
-		roi[:, :, c] = overlay_color[:, :, c] * alpha_mask + roi[:, :, c] * (1.0 - alpha_mask)
-
-	return background
-
-
-def apply_gym_filter(frame):
-	# soft gaussian blur with a small kernel, just to smooth out the noise
-	# without losing too much detail
-	frame = cv2.GaussianBlur(frame, (3, 3), 0)
-	# convert to LAB color space for better contrast manipulation
-	lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
-	# split the LAB channels to apply CLAHE only on the L channel (lightness),
-	# so that we enhance contrast without affecting colors
-	l, a, b = cv2.split(lab)  # noqa: E741
-	# smaller gridsize for more local contrast enhancement,
-	# but not too small to avoid over-sharpening
-	clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
-	# apply CLAHE to the L channel to enhance contrast, which can help in making the lifter
-	# more visible against the background, especially in varying lighting conditions
-	cl = clahe.apply(l)
-	# merge the enhanced L channel back with the original A and B channels to keep the
-	# color information intact while improving the overall contrast of the image
-	limg = cv2.merge((cl, a, b))
-	# convert back to BGR color space for further processing and display
-	frame = cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
-
-	# we use a larger sigma for a stronger blur effect, which will be used to create
-	# a glow around the lifter when we blend it back with the original frame
-	gaussian_3 = cv2.GaussianBlur(frame, (0, 0), 2.0)
-
-	# blend the original frame with the blurred version to create a glow effect around
-	# the lifter, which can help in making them stand out more against the background,
-	# especially in dynamic gym environments where there may be a lot of visual
-	# noise and distractions
-	frame = cv2.addWeighted(frame, 1.5, gaussian_3, -0.5, 0)
+		roi[:, :, c] = logo_color[:, :, c] * alpha_mask + roi[:, :, c] * (1.0 - alpha_mask)
 
 	return frame
 
 
-def put_text(
-	frame: MatLike,
-	text: str,
-	position_percent: tuple[float, float],
-	font_scale: float = 1,
-	color=(255, 255, 255),
-	thickness=2,
-	font_face=cv2.FONT_HERSHEY_SIMPLEX,
-	line_type=cv2.LINE_AA,
-):
+def draw_responsive_text(frame, text, rel_y=0.5, rel_x=0.5):
 	h, w = frame.shape[:2]
-	position = (int(w * position_percent[0]), int(h * position_percent[1]))
-	cv2.putText(
-		frame,
-		text,
-		position,
-		font_face,
-		font_scale,
-		color,
-		thickness,
-		line_type,
-	)
+
+	# Schriftgröße basierend auf der Bildhöhe (z.B. 2% der Höhe)
+	font_scale = h * 0.0015
+	thickness = max(1, int(h * 0.002))
+	font = cv2.FONT_HERSHEY_SIMPLEX
+
+	# Größe berechnen
+	(text_w, text_h), _ = cv2.getTextSize(text, font, font_scale, thickness)
+
+	# Position berechnen (rel_x=0.5 ist Mitte)
+	x = int(w * rel_x - text_w / 2)
+	y = int(h * rel_y + text_h / 2)
+
+	# Schatten für bessere Lesbarkeit (optional)
+	cv2.putText(frame, text, (x + 2, y + 2), font, font_scale, (0, 0, 0), thickness)
+	# Haupttext
+	cv2.putText(frame, text, (x, y), font, font_scale, (255, 255, 255), thickness)
 
 
-def draw_rotated_text(
-	frame, text, position_percent: tuple[float, float], font, scale, color, thickness, angle
+def get_relative_font_scale(frame, percent=0.05):
+	"""
+	Berechnet fontScale basierend auf der Frame-Breite.
+	0.05 entspricht 5% der Breite.
+	"""
+	width = frame.shape[1]
+	# Ein guter Basiswert: Bei 1920px Breite ist fontScale 1.0 oft ca. 2% der Breite.
+	# Wir skalieren das nun linear:
+	return (width / 1000) * (percent * 10)
+
+
+def prepare_rotated_text(
+	text, font, frame_width: int, percent_width: float, color, thickness, angle
 ):
-	# 1. Textgröße berechnen
-	text_size, baseline = cv2.getTextSize(text, font, scale, thickness)
+	"""
+	Berechnet die Schriftgröße basierend auf einem Prozentsatz der Frame-Breite.
+	percent_of_width: z.B. 0.05 für 5% der Breite
+	"""
+	# 1. Berechne font_scale:
+	# Ein fontScale von 1.0 bei 1000px Breite entspricht ca. 22-25px Höhe.
+	# Wir skalieren das so, dass 'percent_of_width' die Zielgröße steuert.
+	font_scale = (frame_width / 1000) * (percent_width * 20)
+
+	# 2. Berechne Dicke proportional zur Breite (mindestens 1)
+	final_thickness = max(thickness, 1, int(frame_width * 0.005))
+
+	# Textgröße für das temporäre Bild berechnen
+	text_size, _ = cv2.getTextSize(text, font, font_scale, final_thickness)
 	tw, th = text_size
 
-	h, w = frame.shape[:2]
-	position = (int(w * position_percent[0]), int(h * position_percent[1]))
-
-	# Sicherheitscheck: Falls der Text leer ist
-	if tw <= 0 or th <= 0:
-		return frame
-
-	# 2. Ein ausreichend großes temporäres Bild erstellen (Quadratisch, um Drehung zu erlauben)
-	# Wir nehmen die Diagonale als Seitenlänge, damit der Text beim Drehen nicht abgeschnitten wird
+	# Quadratische Leinwand für die Rotation
 	side = int((tw**2 + th**2) ** 0.5) + 20
 	text_img = np.zeros((side, side, 3), dtype=np.uint8)
 
-	# Text in die Mitte des schwarzen Bildes schreiben
-	text_x = (side - tw) // 2
-	text_y = (side + th) // 2
-	cv2.putText(text_img, text, (text_x, text_y), font, scale, (255, 255, 255), thickness)
+	# Text mittig zeichnen
+	cv2.putText(
+		text_img, text, ((side - tw) // 2, (side + th) // 2), font, font_scale, color, thickness
+	)
 
-	# 3. Das Bild drehen
-	center = (side // 2, side // 2)
-	M = cv2.getRotationMatrix2D(center, angle, 1.0)
-	rotated_text = cv2.warpAffine(text_img, M, (side, side))
+	# Rotationsmatrix und Warp
+	M = cv2.getRotationMatrix2D((side // 2, side // 2), 90, 1.0)
+	rotated_img = cv2.warpAffine(text_img, M, (side, side))
 
-	# FEHLER-CHECK: Sicherstellen, dass rotated_text existiert
-	if rotated_text is None:
-		return frame
+	# Tight Crop (wie zuvor besprochen), um Offsets am Rand zu vermeiden
+	gray = cv2.cvtColor(rotated_img, cv2.COLOR_BGR2GRAY)
+	coords = cv2.findNonZero(gray)
+	if coords is not None:
+		x_c, y_c, w_c, h_c = cv2.boundingRect(coords)
+		tight_img = rotated_img[y_c : y_c + h_c, x_c : x_c + w_c]
+	else:
+		tight_img = rotated_img
 
-	# 4. Maske erstellen (wo ist Text?)
-	gray = cv2.cvtColor(rotated_text, cv2.COLOR_BGR2GRAY)
-	_, mask = cv2.threshold(gray, 1, 255, cv2.THRESH_BINARY)
+	return tight_img
 
-	# 5. Region of Interest (ROI) im Hauptbild finden
-	y_start, x_start = position
 
-	h_rot, w_rot = rotated_text.shape[:2]
+def apply_cached_overlay(
+	frame,
+	cached_img,
+	relative_position,
+	anchor_x: Literal['left', 'right'] = 'left',
+	anchor_y: Literal['bottom', 'top'] = 'bottom',
+	use_mask: bool = True,
+):
+	h_frame, w_frame = frame.shape[:2]
+	h_rot, w_rot = cached_img.shape[:2]
+	rel_x, rel_y = relative_position
 
-	# Prüfen, ob die Koordinaten im Bild liegen (Crop gegen Out-of-Bounds)
-	y_end = min(y_start + h_rot, h)
-	x_end = min(x_start + w_rot, w)
+	# --- X-Koordinate berechnen ---
+	base_x = int(w_frame * rel_x)
+	if anchor_x == 'right':  # noqa: SIM108
+		x = base_x - w_rot
+	else:  # "left"
+		x = base_x
 
-	# Tatsächliche Größe der Fläche, die wir beschreiben können
-	h_real = y_end - y_start
-	w_real = x_end - x_start
+		# --- Y-Koordinate berechnen ---
+	if anchor_y == 'top':  # noqa: SIM108
+		# Von oben: y ist direkt der Anteil der Frame-Höhe
+		y = int(h_frame * rel_y)
+	else:  # "bottom"
+		# Von unten: (FrameHeight - Anteil) - BildHeight
+		y = int(h_frame * (1 - rel_y)) - h_rot
+
+		# --- Out-of-bounds check (Clipping) ---
+		# Wir berechnen die Startpunkte im Overlay, falls es teilweise aus dem Bild ragt
+	overlay_y_start = max(0, -y)
+	overlay_x_start = max(0, -x)
+
+	# Korrigierte Startpunkte im Frame
+	frame_y_start = max(0, y)
+	frame_x_start = max(0, x)
+
+	# Endpunkte im Frame
+	frame_y_end = min(frame_y_start + h_rot - overlay_y_start, h_frame)
+	frame_x_end = min(frame_x_start + w_rot - overlay_x_start, w_frame)
+
+	# Tatsächliche Dimensionen des Ausschnitts
+	h_real = frame_y_end - frame_y_start
+	w_real = frame_x_end - frame_x_start
 
 	if h_real > 0 and w_real > 0:
-		print(f'Placing text at: ({x_start}, {y_start}), size: ({w_real}x{h_real})')
-		# Nur den Teil des Textes nehmen, der auch ins Bild passt
-		roi = frame[y_start:y_end, x_start:x_end]
-		mask_part = mask[0:h_real, 0:w_real]
+		roi = frame[frame_y_start:frame_y_end, frame_x_start:frame_x_end]
+		# Wir nehmen nur den Teil des Overlays, der ins Frame passt
+		overlay_part = cached_img[
+			overlay_y_start : overlay_y_start + h_real, overlay_x_start : overlay_x_start + w_real
+		]
 
-		# Farbe auf die Masken-Pixel anwenden
-		roi[mask_part > 0] = color
+		# Maskierung (überall wo nicht Schwarz)
+		# mask = np.any(overlay_part > 0, axis=-1)
+		# roi[mask] = overlay_part[mask]
 
-	return frame
-
-
-print("Station bereit.  für Start/Stopp, 'q' zum Beenden.")
-
-
-qr_img = None
-
-while True:
-	# 1. Frame von Kamera lesen (nur wenn wir nicht im Replay sind)
-	qr_img = None  # QR-Code zurücksetzen, damit er im nächsten Replay neu generiert wird
-
-	if state != 'REPLAY' and state != 'PROCESSING':
-		ret, frame = video.read()
-
-		# draw_rotated_text(
-		# frame, 'BEREIT', (100, 50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2, 90
-		# )
-
-		# Gedrehtes Logo einblenden (z.B. oben rechts)
-		try:
-			# Koordinaten berechnen (Beispiel: Oben Rechts)
-			# x = Gesamtbreite - Logobreite - Abstand
-			# y = Abstand von oben
-			h_logo, w_logo = logo_final.shape[:2]
-			# x_pos = frame.shape[1] - w_logo - 30
-			x_pos = 30
-			y_pos = 30
-
-			# Die Funktion einfügen
-			frame = overlay_transparent(frame, logo_final, x_pos, y_pos)
-		except Exception as e:
-			print(f'Fehler beim Einblenden des Logos: {e}')
-
-		# Wenn Daten korrupt sind, liefert OpenCV oft ein leeres Bild oder None
-		if not ret or frame is None or frame.size == 0:
-			continue  # Überspringe diesen Frame einfach und nimm den nächsten
-
-		frame = apply_gym_filter(frame)
-		if not ret:
-			print('break2')
-			break
-		display_frame = frame.copy()
-
-		# FPS calculation
-		new_frame_time = time.time()
-		# fps = 1 / (time difference between current frame and previous frame)
-
-		fps = 1 / (new_frame_time - prev_frame_time)
-		prev_frame_time = new_frame_time
-
-		# show FPS in top-left corner
-
-		"""
-		put_text(
-			display_frame,
-			f'FPS: {int(fps)}',
-			(0.05, 0.05),
-			font_scale=1,
-			color=(0, 255, 0),
-			thickness=2,
-		)
-		"""
-
-	current_time = time.time()
-
-	# countdown
-	if state == 'COUNTDOWN':
-		remaining = 2 - int(current_time - countdown_timer)
-		if remaining > 0:
-			font = cv2.FONT_HERSHEY_DUPLEX
-			text = str(remaining)
-			# Dicke (thickness) auf 15 für massiven Look
-
-			if display_frame is not None and display_frame.any():
-				"""
-				put_text(
-					display_frame,
-					text,
-					(0.3, 0.5),
-					font_scale=7,
-					color=(0, 255, 255),
-					thickness=15,
-				)
-				"""
-
-				try:
-					draw_rotated_text(
-						display_frame,
-						text,
-						(0.01, 0.3),
-						cv2.FONT_HERSHEY_SIMPLEX,
-						35,
-						(0, 255, 255),
-						35,
-						90,
-					)
-				except Exception as e:
-					print(f'Fehler beim Zeichnen des Textes: {e}')
+		if use_mask:
+			# Für Text: Nur farbige Pixel überlagern
+			mask = np.any(overlay_part > 0, axis=-1)
+			roi[mask] = overlay_part[mask]
 		else:
-			# Wechsel zu RECORDING
-			state = 'RECORDING'
-			timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-			temp_filename = os.path.join(SAVE_PATH, f'lift_{timestamp}_temp.avi')
-			replay_filename = os.path.join(SAVE_PATH, f'lift_{timestamp}.mp4')
-			# fourcc = cv2.VideoWriter.fourcc(*'MJPG')
+			# Für QR-Code: Das gesamte Rechteck stumpf drüberbügeln
+			# Das erhält den schwarzen Hintergrund und den Kontrast
+			frame[frame_y_start:frame_y_end, frame_x_start:frame_x_end] = overlay_part
 
-			h, w = frame.shape[:2]
-			fourcc = cv2.VideoWriter_fourcc(*'XVID')
-			video_writer = cv2.VideoWriter(
-				temp_filename,  # the temporary raw video file (MJPG)
-				fourcc,  # this is the codec for MJPG
-				30.0,  # the actual FPS
-				(w, h),
-			)
-			start_time = time.time()
-			frame_count = 0
+	"""
+	x = int(frame.shape[1] * relative_position[0])
+	# compute y from bottom, not from top, because the text is rotated
+	# y = int(frame.shape[0] * relative_position[1])
+	y = int(frame.shape[0] * (1 - relative_position[1])) - cached_img.shape[0]
+	h_rot, w_rot = cached_img.shape[:2]
+	h_frame, w_frame = frame.shape[:2]
 
-	# --- LOGIK: RECORDING ---
-	elif state == 'RECORDING':
-		if frame is not None and frame.any() and video_writer:
-			video_writer.write(frame)
-		frame_count += 1
-		if display_frame is not None and display_frame.any():
-			"""
-			put_text(
-				display_frame,
-				'REC',
-				(0.05, 0.1),
-				font_scale=1,
+	# Out-of-bounds check
+	y_end = min(y + h_rot, h_frame)
+	x_end = min(x + w_rot, w_frame)
+	h_real = y_end - y
+	w_real = x_end - x
+
+	if h_real > 0 and w_real > 0:
+		roi = frame[y:y_end, x:x_end]
+		text_part = cached_img[0:h_real, 0:w_real]
+
+		# Effizientes Überlagern ohne Thresholding im Loop
+		# Überall wo der Text-Part nicht schwarz (0) ist, ersetzen wir das Frame-Pixel
+		mask = np.any(text_part > 0, axis=-1)
+		roi[mask] = text_part[mask]
+	"""
+
+
+def prepare_rotated_qr(url, angle):
+	logging.info(f'Generating and rotating QR code: {angle}°')
+
+	# 1. QR generieren (deine Funktion)
+	qr_bgr = generate_qr(url)
+
+	# 2. Rotieren
+	h, w = qr_bgr.shape[:2]
+	center = (w // 2, h // 2)
+	M = cv2.getRotationMatrix2D(center, angle, 1.0)
+
+	# Da QR-Codes Quadrate sind, reicht w, h als Zielgröße
+	rotated_qr = cv2.warpAffine(qr_bgr, M, (w, h), borderValue=(0, 0, 0))
+
+	return rotated_qr
+
+
+def apply_cached_qr(frame, cached_qr, relative_position):
+	h_f, w_f = frame.shape[:2]
+	h_q, w_q = cached_qr.shape[:2]
+
+	# Position berechnen
+	x = int(w_f * relative_position[0])
+	y = int(h_f * (1 - relative_position[1])) - h_q
+
+	# Clipping / Bounds Check
+	y_end = min(y + h_q, h_f)
+	x_end = min(x + w_q, w_f)
+
+	# Tatsächliche Dimensionen im Frame (falls am Rand abgeschnitten)
+	h_real = y_end - y
+	w_real = x_end - x
+
+	if h_real > 0 and w_real > 0:
+		# Wir kopieren einfach das gesamte Rechteck drüber (ohne Maske!)
+		frame[y:y_end, x:x_end] = cached_qr[0:h_real, 0:w_real]
+
+
+class Video:
+	def __init__(self, video: cv2.VideoCapture, config: Config):
+		self._video: cv2.VideoCapture = video
+		self._config: Config = config
+		self._frame_width: int = 0
+		self._overlays: dict[str, dict[str, np.ndarray | tuple]] = {}
+		self.state = State.LIVE
+		success, init_frame = video.read()
+		if not success:
+			msg = 'Camera does not provide video data'
+			logging.error(msg)
+			raise Exception(msg)
+
+		self._frame_height = init_frame.shape[0]
+		self._frame_width = init_frame.shape[1]
+		self._prepare_overlays()
+
+	def _prepare_overlays(self):
+		self._overlays['ready'] = {
+			'overlay': prepare_rotated_text(
+				text='READY',
+				font=cv2.FONT_HERSHEY_SIMPLEX,
+				frame_width=self._frame_width,
+				percent_width=0.1,
+				color=(0, 255, 255),  # green
+				thickness=6,
+				angle=90,
+			),
+			'position': (0.02, 0.02),
+		}
+		self._overlays['recording'] = {
+			'overlay': prepare_rotated_text(
+				text='RECORDING',
+				font=cv2.FONT_HERSHEY_SIMPLEX,
+				frame_width=self._frame_width,
+				percent_width=0.1,
 				color=(0, 0, 255),
-				thickness=2,
+				thickness=6,
+				angle=90,
+			),
+			'position': (0.02, 0.02),
+		}
+		self._overlays['processing'] = {
+			'overlay': prepare_rotated_text(
+				text='PROCESSING',
+				font=cv2.FONT_HERSHEY_SIMPLEX,
+				frame_width=self._frame_width,
+				percent_width=0.1,
+				color=(0, 255, 0),
+				thickness=6,
+				angle=90,
+			),
+			'position': (0.02, 0.02),
+		}
+
+		self._overlays['replay'] = {
+			'overlay': prepare_rotated_text(
+				text='REPLAY',
+				font=cv2.FONT_HERSHEY_SIMPLEX,
+				frame_width=self._frame_width,
+				percent_width=0.1,
+				color=(255, 255, 0),
+				thickness=6,
+				angle=90,
+			),
+			'position': (0.02, 0.02),
+		}
+
+		self._overlays['qr'] = {  # type: ignore
+			'overlay': prepare_rotated_qr(self._config.server_url, 90),
+			'position': (0.98, 0.05),
+			'anchor_x': 'right',
+			'anchor_y': 'top',
+			'use_mask': False,  # Wir wollen den schwarzen Hintergrund des QR-Codes erhalten
+		}
+
+	def _get_frame(self):
+		success, frame = self._video.read()
+		if not success:
+			msg = 'Failed to grab frame from video source'
+			logging.error(msg)
+			raise RuntimeError(msg)
+
+		return frame
+
+	def _add_logo(self, frame: np.ndarray):
+		return add_logo(self._config, frame)
+
+	def _add_overlays(self, frame: np.ndarray, overlays: list[str]):
+		for overlay in overlays:
+			anchor_x = 'left'
+			anchor_y = 'bottom'
+			use_mask = True
+
+			if 'anchor_x' in self._overlays[overlay]:
+				anchor_x = self._overlays[overlay]['anchor_x']
+			if 'anchor_y' in self._overlays[overlay]:
+				anchor_y = self._overlays[overlay]['anchor_y']
+			if 'use_mask' in self._overlays[overlay]:
+				use_mask = self._overlays[overlay]['use_mask']
+
+			apply_cached_overlay(
+				frame,
+				self._overlays[overlay]['overlay'],
+				relative_position=self._overlays[overlay]['position'],
+				anchor_x=anchor_x,  # type: ignore
+				anchor_y=anchor_y,  # type: ignore
+				use_mask=use_mask,  # type: ignore
 			)
-			"""
 
-			try:
-				draw_rotated_text(
-					display_frame,
-					'REC',
-					(0.2, 0.00001),
-					cv2.FONT_HERSHEY_SIMPLEX,
-					5,
-					(0, 0, 255),
-					10,
-					90,
-				)
-			except Exception as e:
-				print(f'Fehler beim Zeichnen des Textes: {e}')
+	def show(self):
+		logger.debug(f'Current state: {self.state.name}')
+		frame = self._get_frame()
+		frame = self._add_logo(frame)
+		if self.state == State.LIVE:
+			self._add_overlays(frame, ['ready'])
+		elif self.state == State.RECORDING:
+			self.video_writer.write(frame)
+			self._add_overlays(frame, ['recording'])
+			print('write frame to video')
 
-	# --- LOGIK: REPLAY ---
-	elif state == 'REPLAY':
-		if not replay_video:
-			continue
-		ret, replay_frame = replay_video.read()
+			self.frame_count += 1
+		elif self.state == State.PROCESSING:
+			self._add_overlays(frame, ['processing'])
 
-		if not ret:
-			# end of video, reset to beginning
-			replay_video.set(cv2.CAP_PROP_POS_FRAMES, 0)
-			continue
+			time.sleep(0.5)
 
-		# display QR code
-		margin = 30
-		# place QR code in the top-right corner with a margin
-		if qr_img is None:
-			qr_img = generate_qr(SERVER_URL + '?video=' + os.path.basename(replay_filename))
-			qr_h, qr_w, _ = qr_img.shape
-
-			replay_frame[margin : margin + qr_h, WIDTH - qr_w - margin : WIDTH - margin] = qr_img
-
-		# place "LOOP REPLAY"
-
-		try:
-			draw_rotated_text(
-				replay_frame,
-				'REPLAY - SPACE TO STOP',
-				(0.2, 1.45),
-				cv2.FONT_HERSHEY_SIMPLEX,
-				1.25,
-				(0, 165, 255),
-				3,
-				90,
-			)
-		except Exception as e:
-			print(f'Fehler beim Zeichnen des Textes: {e}')
-
-		# this function is called only in REPLAY state, so we show the replay frame with QR code
-		# and texts.
-		# In LIVE and COUNTDOWN states, we show the normal display_frame without QR code.
-		cv2.imshow(window_name, replay_frame)
-
-		# we make a short delay here to allow the replay video to play at a reasonable
-		# speed, and also to check for key presses to exit the replay.
-		# BERECHNUNG DER WARTEZEIT:
-		# Wenn das Original 30 FPS hatte und FFmpeg es verdoppelt hat (setpts=2.0),
-		# müssen wir jetzt mit ca. 15 FPS abspielen.
-		# Formel: 1000ms / (actual_fps / 2)
-		# Bei 30 FPS Kamera: 1000 / 15 = 66ms
-
-		wait_time = int(1000 / (actual_fps / 2))
-		key = cv2.waitKey(wait_time) & 0xFF
-
-		if key == ord(' '):
-			replay_video.release()
-			state = 'LIVE'
-		elif key == ord('q'):
-			break
-		continue
-
-	elif state == 'PROCESSING':
-		time.sleep(0.5)  # Gib der CPU Luft zum Atmen
-
-		ret, frame = video.read()  # Weiterhin Live-Bild lesen
-		if ret:
-			display_frame = apply_gym_filter(frame)
-			# Overlay für den Lade-Status
-
-			"""
-			put_text(
-				display_frame,
-				'PROCESSING LIFT...',
-				(0.3, 0.5),
-				font_scale=1.2,
-				color=(0, 165, 255),
-				thickness=3,
-			)
-			"""
-
-			try:
-				draw_rotated_text(
-					display_frame,
-					'Processing Video...',
-					(0.1, 0.5),
-					cv2.FONT_HERSHEY_SIMPLEX,
-					2,
-					(0, 165, 255),
-					4,
-					90,
-				)
-			except Exception as e:
-				print(f'Fehler beim Zeichnen des Textes: {e}')
-
-			cv2.imshow(window_name, display_frame)
-
-		# Prüfen, ob FFmpeg fertig ist
-		# poll() ist None, solange der Prozess läuft
-
-		if ffmpeg_process:  # and ffmpeg_process.poll() is not None:
-			ffmpeg_result = ffmpeg_process.poll()
-			print(f'ffmpeg result: {ffmpeg_result}')
+			ffmpeg_result = self._ffmpeg_process.poll()
 			if ffmpeg_result is not None:
-				if os.path.exists(temp_filename):
-					os.remove(temp_filename)
+				logging.info(f'ffmpeg finished with code {ffmpeg_result}')
+				self.state = State.REPLAY
 
-			replay_video = cv2.VideoCapture(replay_filename)
-			state = 'REPLAY'
+				self._replay_video = cv2.VideoCapture(self._replay_filename)
+			else:
+				logging.info('ffmpeg still processing...')
 
-		# Auch hier auf ' ' prüfen, falls man abbrechen will
-		if cv2.waitKey(1) & 0xFF == ord(' '):
-			print('break1')
+		elif self.state == State.REPLAY:
+			ret, frame = self._replay_video.read()
+			if not ret:
+				# end of video, reset to beginning
+				self._replay_video.set(cv2.CAP_PROP_POS_FRAMES, 0)
+				ret, frame = self._replay_video.read()
+
+			# disable qr for now
+			self._add_overlays(frame, ['replay'])  # , 'qr'])
+
+		elif self.state == State.COUNTDOWN:
+			current_time = time.time()
+			remaining = config.countdown_duration - int(current_time - self.countdown_timer)
+			if remaining > 0:
+				countdown_text = prepare_rotated_text(
+					text=f'{remaining}',
+					font=cv2.FONT_HERSHEY_SIMPLEX,
+					frame_width=frame.shape[1],
+					percent_width=0.6,
+					color=(0, 255, 255),
+					thickness=30,
+					angle=90,
+				)
+				apply_cached_overlay(
+					frame,
+					countdown_text,
+					relative_position=(
+						0.5 - (countdown_text.shape[1] / frame.shape[1]) / 2,  # X von links, Mitte
+						0.5 - (countdown_text.shape[0] / frame.shape[0]) / 2,
+					),  # Mitte
+				)
+			else:
+				self.state = State.RECORDING
+				logging.info('Countdown finished, switching to RECORDING state')
+				timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+				self._temp_filename = os.path.join(
+					self._config.save_path, f'lift_{timestamp}_temp.avi'
+				)
+				self._replay_filename = os.path.join(
+					self._config.save_path, f'lift_{timestamp}.mp4'
+				)
+
+				actual_fps = self._video.get(cv2.CAP_PROP_FPS)
+				logger.debug(f'Camera reported FPS: {actual_fps}')
+				if actual_fps <= 0 or actual_fps > 60:  # Fallback, falls die Kamera lügt
+					actual_fps = 30.0
+
+				self.video_writer = cv2.VideoWriter(
+					self._temp_filename,  # the temporary raw video file (MJPG)
+					cv2.VideoWriter.fourcc(*'MJPG'),  # this is the codec for MJPG
+					actual_fps,  # the actual FPS
+					(self._frame_width, self._frame_height),
+				)
+				logging.info('Started recording to temporary file: %s', self._temp_filename)
+
+				self.start_time = time.time()
+				self.frame_count = 0
+
+		cv2.imshow('Lifter', frame)
+
+	def start_recording(self):
+		self.state = State.COUNTDOWN
+		self.countdown_timer = time.time()
+
+	def stop_recording(self):
+		self.state = State.PROCESSING
+
+		duration = time.time() - self.start_time
+		real_fps = self.frame_count / duration
+		print(f'Effektive FPS während der Aufnahme: {real_fps}')
+
+		cmd = [
+			'nice',
+			'-n',
+			'15',
+			'ffmpeg',
+			'-y',
+			'-i',
+			self._temp_filename,
+			#'-vf',
+			#'setpts=2.0*PTS',
+			'-c',
+			'copy',
+			'-video_track_timescale',
+			#'15',
+			str(real_fps),
+			#'-vf',
+			#'setpts=8.0*PTS',
+			'-c:v',
+			'libx264',
+			'-preset',
+			'ultrafast',
+			'-threads',
+			'1',  # WICHTIG: Begrenze auf 1 Kern, damit 1-3 Kerne für Python frei bleiben
+			'-pix_fmt',
+			'yuv420p',
+			self._replay_filename,
+		]
+
+		self._ffmpeg_process = subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
+
+		print(f'ffmpeg started with code {self._ffmpeg_process.poll()}')
+		return real_fps
+
+
+def main_loop(video_capture: cv2.VideoCapture, config: Config):
+	logging.info('Starting main loop')
+
+	# state = State.LIVE
+
+	video = Video(video_capture, config)
+
+	cached_qr = prepare_rotated_qr(config.server_url, 90)  # 90 Grad für Hochkant-Monitor
+
+	countdown_timer = 0.0
+
+	actual_fps = config.fps
+
+	wait_time = int(1000 / (actual_fps / 2))
+	while True:
+		# state, frame = video.process_frame(state)
+		video.show()
+		print('hier')
+
+		# show the frame in fullscreen
+		# cv2.imshow('Lifter', frame)
+
+		key = cv2.waitKeyEx(wait_time)  # & 0xFF
+		if key != -1:
+			print(key)
+		if key == ord('q'):
 			break
-		continue
 
-	# display the current frame (with overlays) in LIVE and COUNTDOWN states
-	if display_frame is not None and display_frame.any():
-		cv2.imshow(window_name, display_frame)
+		elif key == ord('b'):
+			if video.state == State.LIVE:
+				logging.info('Switching to RECORDING state')
+				# state = State.COUNTDOWN
+				# countdown_timer = time.time()
+				video.start_recording()
+			elif video.state == State.RECORDING:
+				actual_fps = video.stop_recording()
+				# wait_time = int(1000 / (actual_fps / 2))
 
-	# key press handling for LIVE and COUNTDOWN states (REPLAY state is handled separately above)
-	key = cv2.waitKey(1) & 0xFF
+			elif video.state == State.REPLAY:
+				logging.info('Switching back to LIVE state')
+				video.state = State.LIVE
 
-	# handle " " key for starting/stopping recording, and 'q' for quitting the application
-
-	# print(state)
-	if key == ord(' '):
-		if state == 'LIVE':
-			state = 'COUNTDOWN'
-			countdown_timer = time.time()
-		elif state == 'RECORDING':
-			# Aufnahme stoppen
-			state = 'LIVE'  # Kurz auf Live, während wir konvertieren
-			if video_writer:
-				video_writer.release()
-			duration = time.time() - start_time
-			measured_fps = frame_count / duration
-
-			# Konvertierung (synchron, da kurz)
-			# Konvertierung mit eingebauter Zeitlupe (0.5x)
-			cmd = [
-				'ffmpeg',
-				'-y',
-				'-r',
-				str(measured_fps),  # Input FPS
-				'-i',
-				temp_filename,  # Quelle 0: Video
-				'-i',
-				'static/NORDLICHT.png',  # Quelle 1: Logo
-				'-filter_complex',
-				# Schritt 1: Logo skalieren -> [logo]
-				# Schritt 2: Video (0:v) verlangsamen -> [slow]
-				# Schritt 3: [logo] über [slow] legen
-				'[1:v]scale=200:-1[logo];[0:v]setpts=2.0*PTS[slow];[slow][logo]overlay=20:main_h-overlay_h-20',
-				'-c:v',
-				'libx264',
-				'-preset',
-				'ultrafast',  # WICHTIG: Damit du im Gym nicht ewig warten musst
-				'-pix_fmt',
-				'yuv420p',
-				replay_filename,
-			]
-
-			cmd = [
-				'ffmpeg',
-				'-y',
-				#'-r',
-				# str(measured_fps or 30),  # Input FPS mit Fallback
-				'-i',
-				temp_filename,  # Einzige Quelle: Das Video inkl. Logo
-				'-vf',
-				'setpts=2.0*PTS',  # Nur noch die Zeitlupe (0.5x Speed)
-				'-c:v',
-				'libx264',
-				'-preset',
-				'ultrafast',  # Maximale Geschwindigkeit
-				'-pix_fmt',
-				'yuv420p',  # Standard-Format für maximale Kompatibilität
-				replay_filename,
-			]
-
-			# Wir fügen 'nice -n 15' vor den eigentlichen Befehl
-			cmd = [
-				'nice',
-				'-n',
-				'15',
-				'ffmpeg',
-				'-y',
-				'-i',
-				temp_filename,
-				'-vf',
-				'setpts=2.0*PTS',
-				'-c:v',
-				'libx264',
-				'-preset',
-				'ultrafast',
-				'-threads',
-				'1',  # WICHTIG: Begrenze auf 1 Kern, damit 1-3 Kerne für Python frei bleiben
-				'-pix_fmt',
-				'yuv420p',
-				replay_filename,
-			]
-
-			"""
-            subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            # delete the temporary raw video file, we don't need it anymore
-            if os.path.exists(temp_filename):
-                os.remove(temp_filename)
-
-            # start replay
-            replay_video = cv2.VideoCapture(replay_filename)
-            state = "REPLAY"
-            """
-			print('converting video with FFmpeg, please wait...')
-			# Popen startet den Prozess, blockiert aber NICHT das Skript
-			ffmpeg_process = subprocess.Popen(
-				cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-			)
-
-			print(f'ffmpeg strarted with code {ffmpeg_process.poll()}')
-
-			# Sofort in den Replay-Modus springen geht jetzt nicht direkt,
-			# da die Datei erst fertig sein muss.
-			state = 'PROCESSING'  # Neuer Zwischenstatus
-
-	# handle 'q' key to quit the application
-	elif key == ord('q'):
-		break
+	video_capture.release()
+	cv2.destroyAllWindows()
 
 
-video.release()
-cv2.destroyAllWindows()
+if __name__ == '__main__':
+	config = read_config()
+	video_capture = initialize_video(config)
+	main_loop(video_capture, config)
