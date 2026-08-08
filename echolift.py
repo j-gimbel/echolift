@@ -21,7 +21,7 @@ def generate_qr(url):
 	qr.make(fit=True)
 	img: PilImage = qr.make_image(fill_color='black', back_color='white')  # type: ignore
 	img: Image = img.convert('RGB')
-	print("all ok")
+	print('all ok')
 	return cv2.cvtColor(np.array(img), cv2.COLOR_RGB2BGR)
 
 
@@ -302,7 +302,7 @@ while True:
 
 		frame = apply_gym_filter(frame)
 		if not ret:
-			print("break2")
+			print('break2')
 			break
 		display_frame = frame.copy()
 
@@ -367,7 +367,7 @@ while True:
 			timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
 			temp_filename = os.path.join(SAVE_PATH, f'lift_{timestamp}_temp.avi')
 			replay_filename = os.path.join(SAVE_PATH, f'lift_{timestamp}.mp4')
-			#fourcc = cv2.VideoWriter.fourcc(*'MJPG')
+			# fourcc = cv2.VideoWriter.fourcc(*'MJPG')
 
 			h, w = frame.shape[:2]
 			fourcc = cv2.VideoWriter_fourcc(*'XVID')
@@ -375,7 +375,7 @@ while True:
 				temp_filename,  # the temporary raw video file (MJPG)
 				fourcc,  # this is the codec for MJPG
 				30.0,  # the actual FPS
-				(w,h),
+				(w, h),
 			)
 			start_time = time.time()
 			frame_count = 0
@@ -507,10 +507,10 @@ while True:
 
 		# Prüfen, ob FFmpeg fertig ist
 		# poll() ist None, solange der Prozess läuft
-		 
-		if ffmpeg_process:# and ffmpeg_process.poll() is not None:
+
+		if ffmpeg_process:  # and ffmpeg_process.poll() is not None:
 			ffmpeg_result = ffmpeg_process.poll()
-			print(f"ffmpeg result: {ffmpeg_result}")
+			print(f'ffmpeg result: {ffmpeg_result}')
 			if ffmpeg_result is not None:
 				if os.path.exists(temp_filename):
 					os.remove(temp_filename)
@@ -520,7 +520,7 @@ while True:
 
 		# Auch hier auf ' ' prüfen, falls man abbrechen will
 		if cv2.waitKey(1) & 0xFF == ord(' '):
-			print("break1")
+			print('break1')
 			break
 		continue
 
@@ -533,7 +533,7 @@ while True:
 
 	# handle " " key for starting/stopping recording, and 'q' for quitting the application
 
-	#print(state)
+	# print(state)
 	if key == ord(' '):
 		if state == 'LIVE':
 			state = 'COUNTDOWN'
@@ -575,7 +575,7 @@ while True:
 				'ffmpeg',
 				'-y',
 				#'-r',
-				#str(measured_fps or 30),  # Input FPS mit Fallback
+				# str(measured_fps or 30),  # Input FPS mit Fallback
 				'-i',
 				temp_filename,  # Einzige Quelle: Das Video inkl. Logo
 				'-vf',
@@ -591,14 +591,23 @@ while True:
 
 			# Wir fügen 'nice -n 15' vor den eigentlichen Befehl
 			cmd = [
-				'nice', '-n', '15', 
-				'ffmpeg', '-y',
-				'-i', temp_filename,
-				'-vf', 'setpts=2.0*PTS',
-				'-c:v', 'libx264',
-				'-preset', 'ultrafast',
-				'-threads', '1',  # WICHTIG: Begrenze auf 1 Kern, damit 1-3 Kerne für Python frei bleiben
-				'-pix_fmt', 'yuv420p',
+				'nice',
+				'-n',
+				'15',
+				'ffmpeg',
+				'-y',
+				'-i',
+				temp_filename,
+				'-vf',
+				'setpts=2.0*PTS',
+				'-c:v',
+				'libx264',
+				'-preset',
+				'ultrafast',
+				'-threads',
+				'1',  # WICHTIG: Begrenze auf 1 Kern, damit 1-3 Kerne für Python frei bleiben
+				'-pix_fmt',
+				'yuv420p',
 				replay_filename,
 			]
 
@@ -618,9 +627,7 @@ while True:
 				cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
 			)
 
-			print (f"ffmpeg strarted with code {ffmpeg_process.poll()}")
-
-			
+			print(f'ffmpeg strarted with code {ffmpeg_process.poll()}')
 
 			# Sofort in den Replay-Modus springen geht jetzt nicht direkt,
 			# da die Datei erst fertig sein muss.

@@ -7,23 +7,39 @@
     <style>
         body { font-family: sans-serif; background: #000; color: #fff; text-align: center; padding: 20px; }
         .latest-box { border: 2px solid #00ff00; padding: 15px; border-radius: 15px; margin-bottom: 30px; }
+        .error-box { border: 2px solid #ff4444; padding: 20px; border-radius: 15px; background: #221111; }
         video { width: 100%; max-width: 600px; border-radius: 10px; background: #111; }
         .btn { display: block; background: #007bff; color: white; padding: 15px; margin: 10px auto; 
                text-decoration: none; border-radius: 8px; width: 80%; font-weight: bold; }
+        .btn-refresh { background: #28a745; }
         .status-polling { font-size: 0.7em; color: #555; margin-top: 10px; }
+        h3 { margin-top: 0; }
     </style>
 </head>
 <body>
     <h1>🏋️ Deine Lifts</h1>
 
     <div id="content-area">
-        <div class="latest-box">
-            <h3>Letzter Versuch (bereit)</h3>
-            <video id="main-video" controls autoplay muted>
-                <source src="/static/videos/{{ video }}" type="video/mp4">
-            </video>
-            <a href="/static/videos/{{ video }}" class="btn" download>DOWNLOAD CLIP</a>
-        </div>
+        {% if video %}
+            <div class="latest-box">
+                <h3>Letzter Versuch (bereit)</h3>
+                <video id="main-video" controls autoplay muted>
+                    <source src="/static/videos/{{ video }}" type="video/mp4">
+                    Dein Browser unterstützt das Video-Tag nicht.
+                </video>
+                <a href="/download/videos/{{ video }}" class="btn" download>DOWNLOAD CLIP</a>
+            </div>
+        {% else %}
+            <div class="error-box">
+                <h3>Kein Video gefunden</h3>
+                <p>Es ist aktuell kein Replay verfügbar oder die Datei wurde bereits gelöscht.</p>
+                <a href="javascript:location.reload();" class="btn btn-refresh">SEITE AKTUALISIEREN</a>
+            </div>
+        {% endif %}
+    </div>
+
+    <div class="status-polling">
+        Automatische Löschung nach Download aktiv.
     </div>
 </body>
 </html>

@@ -4,3 +4,5 @@ fps=30
 video_source=0
 logo_width=0.2
 countdown_duration=3
+monitor=0
+fullscreen=false

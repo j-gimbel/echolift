@@ -299,6 +299,57 @@ def apply_cached_qr(frame, cached_qr, relative_position):
 		frame[y:y_end, x:x_end] = cached_qr[0:h_real, 0:w_real]
 
 
+class Video:
+	def __init__(self, video: cv2.VideoCapture, config: Config):
+		self._video: cv2.VideoCapture = video
+		self._config: Config = config
+		self._frame_width: int = 0
+		self._overlays: dict[str, dict[str, np.ndarray | tuple]] = {}
+		success, init_frame = video.read()
+		if not success:
+			msg = 'Camera does not provide video data'
+			logging.error(msg)
+			raise Exception(msg)
+
+		self._frame_width = init_frame.shape[1]
+		self._prepare_overlays()
+
+	def _prepare_overlays(self):
+		self._overlays['recording_text'] = {
+			'overlay': prepare_rotated_text(
+				text='RECORDING',
+				font=cv2.FONT_HERSHEY_SIMPLEX,
+				frame_width=self._frame_width,
+				percent_width=0.1,
+				color=(0, 0, 255),
+				thickness=6,
+				angle=90,
+			),
+			'position': (0.02, 0.02),
+		}
+
+	def _get_frame(self):
+		success, frame = self._video.read()
+		if not success:
+			msg = 'Failed to grab frame from video source'
+			logging.error(msg)
+			raise RuntimeError(msg)
+
+		return frame
+
+	def _add_logo(self, frame: np.ndarray):
+		return add_logo(self._config, frame)
+
+	def _add_overlays(self, frame: np.ndarray):
+
+		for overlay in self._overlays:
+			apply_cached_text(
+				frame,
+				self._overlays[overlay]['overlay'],
+				relative_position=self._overlays[overlay]['position'],
+			)
+
+
 def main_loop(video: cv2.VideoCapture, config: Config):
 	logging.info('Starting main loop')
 
@@ -309,7 +360,7 @@ def main_loop(video: cv2.VideoCapture, config: Config):
 		return
 
 		# Maße detektieren
-	frame_height, frame_width = init_frame.shape[:2]
+	frame_width = init_frame.shape[1]
 	logging.info(f'UI Skalierung basiert auf Frame-Breite: {frame_width}px')
 
 	frame_grabbed: bool
@@ -395,6 +446,8 @@ def main_loop(video: cv2.VideoCapture, config: Config):
 			else:
 				logging.info('Countdown finished, switching to RECORDING state')
 				state = State.RECORDING
+
+				# create VideoWriter
 
 		elif state == State.RECORDING:
 			# Hier würdest du den Aufnahme- und Upload-Logik implementieren
