@@ -9,6 +9,7 @@ import time
 import tomllib
 from datetime import datetime
 from enum import Enum
+from typing import Literal
 
 import cv2
 import numpy as np
@@ -18,6 +19,8 @@ import qrcode
 from PIL.Image import Image, logger
 from pydantic import BaseModel
 from qrcode.image.pil import PilImage
+from screeninfo import get_monitors
+from screeninfo.common import Monitor
 
 
 class Config(BaseModel):
@@ -27,6 +30,8 @@ class Config(BaseModel):
 	video_source: int
 	logo_width: float
 	countdown_duration: int
+	monitor: int = 0
+	fullscreen: bool = False
 
 
 class State(Enum):
@@ -66,6 +71,20 @@ def read_config():
 	return config
 
 
+def get_tv_monitor_coords(config: Config):
+	monitors: list[Monitor] = get_monitors()
+	# Wir nehmen den zweiten Monitor (Index 1)
+	# Meistens ist der Fernseher der zweite Eintrag
+	try:
+		tv = monitors[config.monitor]
+	except IndexError as e:
+		msg = f'Monitor index {config.monitor} is out of range. Available monitors: {len(monitors)}'
+		logging.error(msg)
+		raise Exception(msg) from e
+
+	return tv.x, tv.y
+
+
 def initialize_video(config: Config):
 	logging.info('Initializing video capture')
 
@@ -77,27 +96,28 @@ def initialize_video(config: Config):
 	# MJPG ist oft die Ursache für die Korruption bei Billig-Webcams/alten Controllern
 	# Wenn möglich, versuche YUYV (Standard weglassen) oder erhöhe den Buffer
 	video.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*'MJPG'))
-
-	# video = cv2.VideoCapture(config.video_source)
-	# video.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter.fourcc(*'MJPG'))
 	video.set(cv2.CAP_PROP_FPS, config.fps)
-	video.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)
-	video.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+	video.set(cv2.CAP_PROP_FRAME_WIDTH, 192000)
+	video.set(cv2.CAP_PROP_FRAME_HEIGHT, 108000)
 
 	# we create a named window with the fullscreen property
 	cv2.namedWindow('Lifter', cv2.WND_PROP_FULLSCREEN)
 	# we get the actual FPS from the camera, which is important for accurate timing and recording,
-	cv2.setWindowProperty('Lifter', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)  #
+	if config.fullscreen:
+		logging.info('Setting window to fullscreen mode')
+		cv2.setWindowProperty('Lifter', cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)  #
 	# actual_fps = video.get(cv2.CAP_PROP_FPS) or 60.0
 	# Buffer-Größe reduzieren, um Latenz/Korruption zu minimieren
 	# video.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+	x, y = get_tv_monitor_coords(config)
+	cv2.moveWindow('Lifter', x, y)
 
 	return video
 
 
 def generate_qr(url):
 	logging.info('Generating QR code for URL: %s', url)
-	qr = qrcode.QRCode(box_size=6, border=2)
+	qr = qrcode.QRCode(box_size=12, border=2)
 	qr.add_data(url)
 	qr.make(fit=True)
 	img: PilImage = qr.make_image(fill_color='black', back_color='white')  # type: ignore
@@ -241,7 +261,71 @@ def prepare_rotated_text(
 	return tight_img
 
 
-def apply_cached_text(frame, cached_img, relative_position):
+def apply_cached_overlay(
+	frame,
+	cached_img,
+	relative_position,
+	anchor_x: Literal['left', 'right'] = 'left',
+	anchor_y: Literal['bottom', 'top'] = 'bottom',
+	use_mask: bool = True,
+):
+	h_frame, w_frame = frame.shape[:2]
+	h_rot, w_rot = cached_img.shape[:2]
+	rel_x, rel_y = relative_position
+
+	# --- X-Koordinate berechnen ---
+	base_x = int(w_frame * rel_x)
+	if anchor_x == 'right':  # noqa: SIM108
+		x = base_x - w_rot
+	else:  # "left"
+		x = base_x
+
+		# --- Y-Koordinate berechnen ---
+	if anchor_y == 'top':  # noqa: SIM108
+		# Von oben: y ist direkt der Anteil der Frame-Höhe
+		y = int(h_frame * rel_y)
+	else:  # "bottom"
+		# Von unten: (FrameHeight - Anteil) - BildHeight
+		y = int(h_frame * (1 - rel_y)) - h_rot
+
+		# --- Out-of-bounds check (Clipping) ---
+		# Wir berechnen die Startpunkte im Overlay, falls es teilweise aus dem Bild ragt
+	overlay_y_start = max(0, -y)
+	overlay_x_start = max(0, -x)
+
+	# Korrigierte Startpunkte im Frame
+	frame_y_start = max(0, y)
+	frame_x_start = max(0, x)
+
+	# Endpunkte im Frame
+	frame_y_end = min(frame_y_start + h_rot - overlay_y_start, h_frame)
+	frame_x_end = min(frame_x_start + w_rot - overlay_x_start, w_frame)
+
+	# Tatsächliche Dimensionen des Ausschnitts
+	h_real = frame_y_end - frame_y_start
+	w_real = frame_x_end - frame_x_start
+
+	if h_real > 0 and w_real > 0:
+		roi = frame[frame_y_start:frame_y_end, frame_x_start:frame_x_end]
+		# Wir nehmen nur den Teil des Overlays, der ins Frame passt
+		overlay_part = cached_img[
+			overlay_y_start : overlay_y_start + h_real, overlay_x_start : overlay_x_start + w_real
+		]
+
+		# Maskierung (überall wo nicht Schwarz)
+		# mask = np.any(overlay_part > 0, axis=-1)
+		# roi[mask] = overlay_part[mask]
+
+		if use_mask:
+			# Für Text: Nur farbige Pixel überlagern
+			mask = np.any(overlay_part > 0, axis=-1)
+			roi[mask] = overlay_part[mask]
+		else:
+			# Für QR-Code: Das gesamte Rechteck stumpf drüberbügeln
+			# Das erhält den schwarzen Hintergrund und den Kontrast
+			frame[frame_y_start:frame_y_end, frame_x_start:frame_x_end] = overlay_part
+
+	"""
 	x = int(frame.shape[1] * relative_position[0])
 	# compute y from bottom, not from top, because the text is rotated
 	# y = int(frame.shape[0] * relative_position[1])
@@ -263,6 +347,7 @@ def apply_cached_text(frame, cached_img, relative_position):
 		# Überall wo der Text-Part nicht schwarz (0) ist, ersetzen wir das Frame-Pixel
 		mask = np.any(text_part > 0, axis=-1)
 		roi[mask] = text_part[mask]
+	"""
 
 
 def prepare_rotated_qr(url, angle):
@@ -368,7 +453,15 @@ class Video:
 				thickness=6,
 				angle=90,
 			),
-			'position': (0.02, 0.02),
+			'position': (-0.02, 0.02),
+		}
+
+		self._overlays['qr'] = {  # type: ignore
+			'overlay': prepare_rotated_qr(self._config.server_url, 90),
+			'position': (0.98, 0.05),
+			'anchor_x': 'right',
+			'anchor_y': 'top',
+			'use_mask': False,  # Wir wollen den schwarzen Hintergrund des QR-Codes erhalten
 		}
 
 	def _get_frame(self):
@@ -385,10 +478,24 @@ class Video:
 
 	def _add_overlays(self, frame: np.ndarray, overlays: list[str]):
 		for overlay in overlays:
-			apply_cached_text(
+			anchor_x = 'left'
+			anchor_y = 'bottom'
+			use_mask = True
+
+			if 'anchor_x' in self._overlays[overlay]:
+				anchor_x = self._overlays[overlay]['anchor_x']
+			if 'anchor_y' in self._overlays[overlay]:
+				anchor_y = self._overlays[overlay]['anchor_y']
+			if 'use_mask' in self._overlays[overlay]:
+				use_mask = self._overlays[overlay]['use_mask']
+
+			apply_cached_overlay(
 				frame,
 				self._overlays[overlay]['overlay'],
 				relative_position=self._overlays[overlay]['position'],
+				anchor_x=anchor_x,  # type: ignore
+				anchor_y=anchor_y,  # type: ignore
+				use_mask=use_mask,  # type: ignore
 			)
 
 	def show(self):
@@ -419,12 +526,12 @@ class Video:
 
 		elif self.state == State.REPLAY:
 			ret, frame = self._replay_video.read()
-
 			if not ret:
 				# end of video, reset to beginning
 				self._replay_video.set(cv2.CAP_PROP_POS_FRAMES, 0)
 				ret, frame = self._replay_video.read()
-			self._add_overlays(frame, ['replay'])
+
+			self._add_overlays(frame, ['replay', 'qr'])
 
 		elif self.state == State.COUNTDOWN:
 			current_time = time.time()
@@ -439,7 +546,7 @@ class Video:
 					thickness=30,
 					angle=90,
 				)
-				apply_cached_text(
+				apply_cached_overlay(
 					frame,
 					countdown_text,
 					relative_position=(
@@ -502,8 +609,8 @@ class Video:
 			'-video_track_timescale',
 			#'15',
 			str(real_fps),
-			'-vf',
-			'setpts=2.0*PTS',
+			#'-vf',
+			#'setpts=8.0*PTS',
 			'-c:v',
 			'libx264',
 			'-preset',
@@ -518,6 +625,7 @@ class Video:
 		self._ffmpeg_process = subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
 
 		print(f'ffmpeg started with code {self._ffmpeg_process.poll()}')
+		return real_fps
 
 
 def main_loop(video_capture: cv2.VideoCapture, config: Config):
@@ -530,6 +638,10 @@ def main_loop(video_capture: cv2.VideoCapture, config: Config):
 	cached_qr = prepare_rotated_qr(config.server_url, 90)  # 90 Grad für Hochkant-Monitor
 
 	countdown_timer = 0.0
+
+	actual_fps = config.fps
+
+	wait_time = int(1000 / (actual_fps / 2))
 	while True:
 		# state, frame = video.process_frame(state)
 		video.show()
@@ -537,7 +649,7 @@ def main_loop(video_capture: cv2.VideoCapture, config: Config):
 		# show the frame in fullscreen
 		# cv2.imshow('Lifter', frame)
 
-		key = cv2.waitKeyEx(1)  # & 0xFF
+		key = cv2.waitKeyEx(wait_time)  # & 0xFF
 		# print(key)
 		if key == ord('q'):
 			break
@@ -549,7 +661,8 @@ def main_loop(video_capture: cv2.VideoCapture, config: Config):
 				# countdown_timer = time.time()
 				video.start_recording()
 			if video.state == State.RECORDING:
-				video.stop_recording()
+				actual_fps = video.stop_recording()
+				# wait_time = int(1000 / (actual_fps / 2))
 
 			if video.state == State.REPLAY:
 				logging.info('Switching back to LIVE state')
