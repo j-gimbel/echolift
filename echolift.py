@@ -519,6 +519,9 @@ class Video:
 			if ffmpeg_result is not None:
 				logging.info(f'ffmpeg finished with code {ffmpeg_result}')
 				self.state = State.REPLAY
+				# delete temp file
+				os.unlink(self._temp_filename)
+				self._temp_filename = None
 
 				self._replay_video = cv2.VideoCapture(self._replay_filename)
 			else:
@@ -623,6 +626,25 @@ class Video:
 			self._replay_filename,
 		]
 
+		# Für 2-fache Verlangsamung (50% Zeitlupe): setpts=2.0*PTS
+        # Für 4-fache Verlangsamung (25% Zeitlupe): setpts=4.0*PTS
+		cmd = [
+            'nice',
+            '-n',
+            '15',
+            'ffmpeg',
+            '-y',
+            '-r', str(real_fps),           # Die tatsächlichen Eingabe-FPS der Kamera
+            '-i', self._temp_filename,
+            '-vf', 'setpts=2.0*PTS',       # Macht das Video doppelt so lang (Zeitlupe)
+            '-c:v', 'libx264',
+            '-r', str(real_fps),           # Ziel-FPS beibehalten
+            '-preset', 'ultrafast',
+            '-threads', '1',
+            '-pix_fmt', 'yuv420p',
+            self._replay_filename,
+        ]
+
 		self._ffmpeg_process = subprocess.Popen(cmd, stdout=sys.stdout, stderr=sys.stderr)
 
 		print(f'ffmpeg started with code {self._ffmpeg_process.poll()}')
@@ -644,13 +666,7 @@ def main_loop(video_capture: cv2.VideoCapture, config: Config):
 
 	wait_time = int(1000 / (actual_fps / 2))
 	while True:
-		# state, frame = video.process_frame(state)
 		video.show()
-		print('hier')
-
-		# show the frame in fullscreen
-		# cv2.imshow('Lifter', frame)
-
 		key = cv2.waitKeyEx(wait_time)  # & 0xFF
 		if key != -1:
 			print(key)
@@ -660,16 +676,16 @@ def main_loop(video_capture: cv2.VideoCapture, config: Config):
 		elif key == ord('b'):
 			if video.state == State.LIVE:
 				logging.info('Switching to RECORDING state')
-				# state = State.COUNTDOWN
-				# countdown_timer = time.time()
 				video.start_recording()
 			elif video.state == State.RECORDING:
 				actual_fps = video.stop_recording()
-				# wait_time = int(1000 / (actual_fps / 2))
 
 			elif video.state == State.REPLAY:
 				logging.info('Switching back to LIVE state')
 				video.state = State.LIVE
+				# delete replay video
+				os.unlink(video._replay_filename)
+				video._replay_filename = None
 
 	video_capture.release()
 	cv2.destroyAllWindows()
