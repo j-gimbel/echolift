@@ -1,6 +1,6 @@
 # read yaml config  files
 import logging
-
+from evdev import InputDevice, categorize, ecodes, list_devices
 # import yaml
 import os
 import subprocess
@@ -690,6 +690,119 @@ def main_loop(video_capture: cv2.VideoCapture, config: Config):
 	video_capture.release()
 	cv2.destroyAllWindows()
 
+def main_loop_secure(video_capture: cv2.VideoCapture, config: Config):
+	logging.info('Starting main loop')
+
+	# 1. Tastatur suchen & exklusiv sperren
+	# Alle Geräte durchsuchen und gezielt nach der Haupttastatur suchen
+	keyboard_path = None
+
+	# Alle Eingabegeräte durchsuchen
+	for path in list_devices():
+		try:
+			dev = InputDevice(path)
+			caps = dev.capabilities()
+
+			# Prüfen, ob das Gerät Tasten-Events unterstützt
+			if ecodes.EV_KEY in caps:
+				keys = caps[ecodes.EV_KEY]
+				name = dev.name.lower()
+
+				# 1. Bevorzuge explizit die interne Laptop-Tastatur oder Standard-Keyboards
+				if "keyboard" in name or "at translated" in name:
+					keyboard_path = path
+					break
+
+				# 2. Alternativer Fallback: Gerät besitzt Buchstabentasten (A-Z)
+				if (
+					ecodes.KEY_A in keys
+					and ecodes.KEY_Z in keys
+					and not keyboard_path
+				):
+					keyboard_path = path
+		except Exception:
+			continue
+
+	# SAUBERE PRÜFUNG: Verhindert den TypeError (path should not be NoneType)
+	if not keyboard_path:
+		logging.error(
+			"Keine valide Tastatur für Kiosk-Sperre unter /dev/input/ gefunden!"
+		)
+		print("Fehler: Keine Tastatur gefunden. Prüfe Benutzerrechte (Gruppe input).")
+		sys.exit(1)
+	dev = InputDevice(keyboard_path)
+	dev.grab()  # Sperrt Alt+Tab, Super-Taste etc.
+
+	pressed_keys = set()
+	SECRET_COMBO = {
+		ecodes.KEY_LEFTCTRL,
+		ecodes.KEY_LEFTALT,
+		ecodes.KEY_LEFTSHIFT,
+		ecodes.KEY_E,
+	}
+
+	video = Video(video_capture, config)
+
+	cached_qr = prepare_rotated_qr(config.server_url, 90)  # 90 Grad für Hochkant-Monitor
+
+	countdown_timer = 0.0
+
+	actual_fps = config.fps
+
+	wait_time = int(1000 / (actual_fps / 2))
+
+	# --- EINZIGE HAUPTSCHLEIFE ---
+	try:
+		while True:
+			# Video rendern & OpenCV-Window-Events verarbeiten
+			video.show()
+			cv2.waitKey(wait_time)
+
+			# Alle aktuell anliegenden Tastatur-Events in DIESEM Frame abarbeiten
+			while True:
+				event = dev.read_one()
+				if event is None:
+					break  # Keines mehr in der Schlange -> weiter mit nächstem Frame
+
+				if event.type == ecodes.EV_KEY:
+					key_event = categorize(event)
+
+					# Taste gedrückt
+					if key_event.keystate == key_event.key_down:
+						pressed_keys.add(key_event.scancode)
+
+						# 'b' gedrückt -> Aufnahme umschalten
+						if key_event.scancode == ecodes.KEY_B:
+							if video.state == State.LIVE:
+								logging.info('Switching to RECORDING state')
+								video.start_recording()
+							elif video.state == State.RECORDING:
+								actual_fps = video.stop_recording()
+
+							elif video.state == State.REPLAY:
+								logging.info('Switching back to LIVE state')
+								video.state = State.LIVE
+								# delete replay video
+								os.unlink(video._replay_filename)
+								video._replay_filename = None
+
+						# Geheimer Exit Shortcut
+						if SECRET_COMBO.issubset(pressed_keys):
+							logging.info("Geheimer Kiosk-Exit erkannt!")
+							dev.ungrab()
+							#cv2.destroyAllWindows()
+							#os.system("plasmashell &")
+							#sys.exit(0)
+							video_capture.release()
+							cv2.destroyAllWindows()
+
+					# Taste losgelassen
+					elif key_event.keystate == key_event.key_up:
+						pressed_keys.discard(key_event.scancode)
+
+	except Exception as e:
+		dev.ungrab()
+		raise e
 
 if __name__ == '__main__':
 	config = read_config()
